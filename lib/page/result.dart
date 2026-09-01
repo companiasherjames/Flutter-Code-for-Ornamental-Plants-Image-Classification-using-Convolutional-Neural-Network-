@@ -1,0 +1,468 @@
+import 'dart:io';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_tflite/flutter_tflite.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:intl/intl.dart';
+import 'package:ornamental/model/savefav.dart';
+import 'package:ornamental/page/savepage.dart';
+import 'package:ornamental/utils/functions.dart';
+import 'package:ornamental/widget/addplant.dart';
+import 'package:ornamental/widget/panelgraph.dart';
+import 'package:ornamental/widget/pantpageview.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:provider/provider.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+
+class ShowResult extends StatefulWidget {
+  final XFile selectedimage;
+  final File? imageselect;
+  final bool ishome;
+
+  const ShowResult({
+    super.key,
+    required this.selectedimage,
+    this.imageselect,
+    required this.ishome,
+  });
+
+  @override
+  State<ShowResult> createState() => _ShowResultState();
+}
+
+class _ShowResultState extends State<ShowResult> {
+  late PageController _pageController;
+  List? _result = [];
+  bool isloading = false;
+  int? currentlabel;
+  String? errorMessage;
+  String? currentLabelint;
+  bool issaving = false;
+  bool isBookmarked = false; // New state to track bookmark status
+  final ValueNotifier<int> _currentPageNotifier = ValueNotifier<int>(0);
+
+  Future<void> loadModel() async {
+    Tflite.close();
+    await Tflite.loadModel(
+      model: 'assets/model_unquant.tflite',
+      labels: 'assets/labels.txt',
+      isAsset: true,
+      useGpuDelegate: false,
+    );
+  }
+
+  Future<void> imageClassification() async {
+    try {
+      var imgClassification = await Tflite.runModelOnImage(
+        path: widget.ishome
+            ? widget.selectedimage.path
+            : widget.imageselect!.path,
+        numResults: 14,
+        threshold: 0.03,
+        imageMean: 127.5,
+        imageStd: 127.5,
+        asynch: true,
+      );
+      setState(() {
+        _result = imgClassification ?? [];
+        isloading = false;
+      });
+
+      // Check if any result has a confidence above 90%
+      if (_result != null && _result!.isNotEmpty) {
+        bool isAboveThreshold = _result!.any(
+          (element) => element['confidence'] * 100 > 90,
+        );
+
+        if (!isAboveThreshold) {
+          _showAddPlantDialog(); // Call the function to show the dialog
+        }
+      }
+
+      debugPrint("$_result");
+    } catch (error) {
+      debugPrint('$error');
+    }
+  }
+
+  @override
+  void initState() {
+    loadModel();
+    super.initState();
+    initloadedimage();
+    _pageController = PageController(initialPage: 0, viewportFraction: .75);
+    _pageController.addListener(() {
+      _currentPageNotifier.value = _pageController.page?.round() ?? 0;
+    });
+    _currentPageNotifier.addListener(() {
+      _updateCurrentLabel();
+    });
+
+    // Check if the current image is already bookmarked
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      checkIfBookmarked(); // Call the function after the first frame is rendered
+    });
+  }
+
+  @override
+  void dispose() {
+    _currentPageNotifier.removeListener(() {
+      _updateCurrentLabel();
+    });
+    super.dispose();
+  }
+
+  void checkIfBookmarked() {
+    var bookmarkState = Provider.of<BookmarkState>(context, listen: false);
+    setState(() {
+      // Check if the current image is already bookmarked
+      isBookmarked = bookmarkState.isBookmarked(widget.selectedimage.path);
+    });
+  }
+
+  void resultonlyone() {
+    if (_result!.length == 1) {
+      debugPrint("true");
+    }
+  }
+
+  void _updateCurrentLabel() {
+    int currentPage = _currentPageNotifier.value;
+    setState(() {
+      debugPrint("current Page $currentPage");
+      if (_result == null || _result!.isEmpty) {
+        debugPrint("No results available.");
+        currentLabelint = "No result";
+      } else {
+        if (currentPage < _result!.length) {
+          String processedText = _result![currentPage]['label'].toString();
+          currentLabelint = processedText.replaceFirst(RegExp(r'^\d+\s*'), '');
+        } else {
+          String processedText = _result!.first['label'].toString();
+          currentLabelint = processedText.replaceFirst(RegExp(r'^\d+\s*'), '');
+        }
+        debugPrint("Page $currentLabelint");
+      }
+    });
+  }
+
+  void initloadedimage() {
+    setState(() {
+      isloading = true;
+    });
+    Future.delayed(const Duration(seconds: 3), () {
+      imageClassification();
+    });
+  }
+
+  Future<void> savePlantResult(String plantName, double accuracy,
+      File imageFile, String description) async {
+    try {
+      String downloadUrl = await uploadImageToFirebase(imageFile);
+
+      if (downloadUrl.isNotEmpty) {
+        CollectionReference plantResults =
+            FirebaseFirestore.instance.collection('plant_results');
+        String uid = FirebaseAuth.instance.currentUser?.uid ??
+            ''; // Get current user's UID
+
+        await plantResults.add({
+          'uid': uid, // Store the user's UID
+          'plant_name': plantName,
+          'accuracy': accuracy,
+          'image_url':
+              downloadUrl, // Store the image URL instead of the local path
+          'description': description,
+          'timestamp': FieldValue.serverTimestamp(),
+        });
+      }
+    } catch (e) {
+      debugPrint("Error saving plant result: $e");
+    }
+  }
+
+  Future<String> uploadImageToFirebase(File imageFile) async {
+    try {
+      String fileName =
+          'plant_images/${DateTime.now().millisecondsSinceEpoch}.png';
+      Reference storageRef = FirebaseStorage.instance.ref().child(fileName);
+      UploadTask uploadTask = storageRef.putFile(imageFile);
+
+      TaskSnapshot taskSnapshot = await uploadTask.whenComplete(() => {});
+      String downloadUrl = await taskSnapshot.ref.getDownloadURL();
+
+      return downloadUrl;
+    } catch (e) {
+      debugPrint('Error uploading image: $e');
+      return '';
+    }
+  }
+
+  Future<void> handlesave() async {
+    setState(() {
+      issaving = true;
+    });
+
+    var bookmarkState = Provider.of<BookmarkState>(context, listen: false);
+    try {
+      String formattedDate = DateFormat.yMMMMd().format(DateTime.now());
+      String formattedDisc = 'Save $formattedDate';
+      int randomid = generateTwoDigitRandomNumber();
+      final directory = await getApplicationDocumentsDirectory();
+      final localSaveDirectory = Directory('${directory.path}/localsave');
+      if (!await localSaveDirectory.exists()) {
+        await localSaveDirectory.create(recursive: true);
+      }
+
+      String randomLetters = generateRandomLetters(5);
+      String timestamp = DateTime.now().millisecondsSinceEpoch.toString();
+      String imagePath =
+          '${localSaveDirectory.path}/$randomLetters-$timestamp.png';
+
+      final File imageFile = File(widget.selectedimage.path);
+      await imageFile.copy(imagePath);
+      debugPrint(imagePath);
+
+      String description = "Description for ${_result![0]['label']}";
+
+      await savePlantResult(
+        _result![0]['label'],
+        _result![0]['confidence'],
+        imageFile,
+        description,
+      );
+
+      bookmarkState.toggleBookmark(
+        id: "${_result![0]['label']}$randomid",
+        path: imagePath,
+        title: "${_result![0]['label']}",
+        disc: formattedDisc,
+        description: description,
+      );
+
+      setState(() {
+        issaving = false;
+        isBookmarked = true; // Mark as bookmarked
+      });
+
+      debugPrint("save");
+    } catch (e) {
+      debugPrint("Error saving file: $e");
+    }
+  }
+
+  void _showAddPlantDialog() {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Result Not Found'),
+          content: const Text(
+              'The result is not above 90%. Would you like to add this plant?'),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: const Text('No'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _addNewPlant();
+              },
+              child: const Text('Yes'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _addNewPlant() {
+    debugPrint('User wants to add the plant');
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => const AddNewPlant()),
+    );
+  }
+
+  Stream<QuerySnapshot> getUserSavedPlants() {
+    String uid =
+        FirebaseAuth.instance.currentUser?.uid ?? ''; // Get current user's UID
+    return FirebaseFirestore.instance
+        .collection('plant_results')
+        .where('uid',
+            isEqualTo: uid) // Fetch only the results of the current user
+        .snapshots();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    double widthsize = MediaQuery.of(context).size.width;
+    return Scaffold(
+      floatingActionButton: Container(
+        height: 60,
+        width: 60,
+        padding: const EdgeInsets.all(10),
+        decoration: const BoxDecoration(
+            color: Color(0xff88B648), shape: BoxShape.circle),
+        child: IconButton(
+            onPressed: () {
+              Navigator.push(context,
+                  MaterialPageRoute(builder: (context) => const SavePage()));
+            },
+            icon: const Icon(
+              Icons.bookmark_outline,
+              color: Colors.white,
+            )),
+      ),
+      extendBody: true,
+      appBar: AppBar(
+        backgroundColor: const Color(0xff88B648),
+        automaticallyImplyLeading: false, // Custom back button added
+        title: Row(
+          children: [
+            IconButton(
+              icon: const Icon(Icons.arrow_back, color: Colors.white),
+              onPressed: () {
+                Navigator.pop(context); // Navigate back
+              },
+            ),
+            const Text(
+              "Ornamental Plants",
+              style: TextStyle(color: Colors.white),
+            ),
+          ],
+        ),
+        actions: [
+          IconButton(
+              onPressed: () {
+                Navigator.pop(context);
+              },
+              icon: const Icon(
+                Icons.camera_outlined,
+                color: Colors.white,
+              )),
+          issaving == false
+              ? IconButton(
+                  onPressed: () {
+                    if (isBookmarked) {
+                      debugPrint("Already bookmarked");
+                    } else {
+                      handlesave();
+                    }
+                  },
+                  icon: Icon(
+                    isBookmarked
+                        ? Icons.favorite // Filled heart icon
+                        : Icons.favorite_outline, // Outline heart icon
+                    color: isBookmarked ? Colors.red : Colors.white,
+                  ))
+              : const LoadingAnimation(),
+        ],
+      ),
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        mainAxisAlignment: MainAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.only(left: 15, right: 15, bottom: 15),
+            height: 190,
+            width: widthsize,
+            decoration: const BoxDecoration(
+                color: Color(0xff88B648),
+                borderRadius:
+                    BorderRadius.only(bottomRight: Radius.circular(20))),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Expanded(
+                    child: widget.selectedimage.path.isNotEmpty
+                        ? Container(
+                            height: 169,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(10),
+                              image: DecorationImage(
+                                image:
+                                    FileImage(File(widget.selectedimage.path)),
+                                fit: BoxFit.cover,
+                              ),
+                            ))
+                        : Container(
+                            height: 169,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(10),
+                              image: const DecorationImage(
+                                image: AssetImage('assets/image/plant.png'),
+                                fit: BoxFit.cover,
+                              ),
+                            ))),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: isloading == true
+                      ? const Column(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            LinearProgressIndicator(),
+                            SizedBox(
+                              child: Text(
+                                "Analyzing your image Please Wait",
+                                style: TextStyle(color: Colors.white),
+                              ),
+                            )
+                          ],
+                        )
+                      : _result != null && _result!.isNotEmpty
+                          ? (() {
+                              // Sort results to ensure the top confidence result is displayed
+                              _result!.sort((a, b) =>
+                                  b['confidence'].compareTo(a['confidence']));
+                              double topConfidence = _result![0]['confidence'];
+                              String topLabel = _result![0]['label']
+                                  .toString()
+                                  .replaceFirst(RegExp(r'^\d+\s*'), '');
+
+                              return Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  // Show only the result with the highest confidence
+                                  Text(
+                                    topLabel,
+                                    style: const TextStyle(
+                                        fontSize: 20, color: Colors.white),
+                                  ),
+                                  Text(
+                                    "Accuracy: ${(topConfidence * 100).toStringAsFixed(0)}%",
+                                    style: const TextStyle(
+                                        fontSize: 10, color: Colors.white),
+                                  ),
+                                ],
+                              );
+                            })()
+                          : const Text(
+                              "No result found",
+                              style: TextStyle(color: Colors.white),
+                            ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          PageViewPlant(
+              widthsize: widthsize,
+              currentPageNotifier: _currentPageNotifier,
+              pageController: _pageController,
+              result: _result),
+          /* currentLabelint != null || currentLabelint == "No result"
+              ? panelGraph(currentLabelint!, widthsize)
+              : const Text("No Result") */
+        ],
+      ),
+    );
+  }
+}
